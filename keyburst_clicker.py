@@ -10,7 +10,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from ctypes import wintypes
-from pynput import keyboard
 
 
 @dataclass
@@ -45,6 +44,15 @@ WM_HOTKEY = 0x0312
 PM_NOREMOVE = 0x0000
 PM_REMOVE = 0x0001
 WM_QUIT = 0x0012
+INPUT_KEYBOARD = 0x0001
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_SCANCODE = 0x0008
+MAPVK_VK_TO_VSC = 0x0000
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12
 
 VK_CODES = {
     "esc": 0x1B,
@@ -66,6 +74,19 @@ VK_CODES = {
 for i in range(1, 13):
     VK_CODES[f"f{i}"] = 0x6F + i
 
+EXTENDED_KEYS = {
+    "insert",
+    "delete",
+    "home",
+    "end",
+    "page_up",
+    "page_down",
+    "up",
+    "down",
+    "left",
+    "right",
+}
+
 
 class MSG(ctypes.Structure):
     _fields_ = [
@@ -76,6 +97,50 @@ class MSG(ctypes.Structure):
         ("time", wintypes.DWORD),
         ("pt", wintypes.POINT),
     ]
+
+
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = [
+            ("mi", MOUSEINPUT),
+            ("ki", KEYBDINPUT),
+            ("hi", HARDWAREINPUT),
+        ]
+
+    _anonymous_ = ("_input",)
+    _fields_ = [("type", wintypes.DWORD), ("_input", _INPUT)]
 
 
 user32.RegisterHotKey.argtypes = [wintypes.HWND, wintypes.INT, wintypes.UINT, wintypes.UINT]
@@ -99,6 +164,12 @@ user32.GetMessageW.argtypes = [
 user32.GetMessageW.restype = wintypes.BOOL
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+user32.VkKeyScanW.restype = wintypes.SHORT
 
 
 @dataclass(frozen=True)
@@ -230,55 +301,113 @@ class HotkeyManager:
         user32.UnregisterHotKey(None, self.stop_id)
 
 
+class KeySender:
+    def _send_input(self, inputs):
+        if not inputs:
+            return
+        array = (INPUT * len(inputs))(*inputs)
+        user32.SendInput(len(array), array, ctypes.sizeof(INPUT))
+
+    @staticmethod
+    def _vk_input(vk: int, is_keyup: bool, is_extended: bool):
+        scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+        flags = 0
+        if scan:
+            flags |= KEYEVENTF_SCANCODE
+            if is_extended:
+                flags |= KEYEVENTF_EXTENDEDKEY
+        if is_keyup:
+            flags |= KEYEVENTF_KEYUP
+        return INPUT(
+            type=INPUT_KEYBOARD,
+            ki=KEYBDINPUT(
+                wVk=0 if scan else vk,
+                wScan=scan,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            ),
+        )
+
+    @staticmethod
+    def _unicode_input(ch: str, is_keyup: bool):
+        flags = KEYEVENTF_UNICODE
+        if is_keyup:
+            flags |= KEYEVENTF_KEYUP
+        return INPUT(
+            type=INPUT_KEYBOARD,
+            ki=KEYBDINPUT(
+                wVk=0,
+                wScan=ord(ch),
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            ),
+        )
+
+    def send_vk(self, vk: int, is_extended: bool):
+        self._send_input([self._vk_input(vk, False, is_extended), self._vk_input(vk, True, is_extended)])
+
+    def send_vk_with_modifiers(self, modifiers, vk: int, is_extended: bool):
+        inputs = []
+        for mod in modifiers:
+            inputs.append(self._vk_input(mod, False, False))
+        inputs.append(self._vk_input(vk, False, is_extended))
+        inputs.append(self._vk_input(vk, True, is_extended))
+        for mod in reversed(modifiers):
+            inputs.append(self._vk_input(mod, True, False))
+        self._send_input(inputs)
+
+    def send_unicode(self, text: str):
+        inputs = []
+        for ch in text:
+            inputs.append(self._unicode_input(ch, False))
+            inputs.append(self._unicode_input(ch, True))
+        self._send_input(inputs)
+
+    def send_char(self, ch: str):
+        vk_scan = user32.VkKeyScanW(ch)
+        if vk_scan == -1:
+            self.send_unicode(ch)
+            return
+        vk = vk_scan & 0xFF
+        shift_state = (vk_scan >> 8) & 0xFF
+        if shift_state & 0x06:
+            self.send_unicode(ch)
+            return
+        modifiers = []
+        if shift_state & 0x01:
+            modifiers.append(VK_SHIFT)
+        if modifiers:
+            self.send_vk_with_modifiers(modifiers, vk, False)
+        else:
+            self.send_vk(vk, False)
+
+    def send_text(self, text: str):
+        for ch in text:
+            self.send_char(ch)
+
+
 class ClickerThread(threading.Thread):
     def __init__(self, items, stop_event):
         super().__init__(daemon=True)
         self.items = items
         self.stop_event = stop_event
-        self.controller = keyboard.Controller()
-        self.special_map = self._build_special_map()
-
-    @staticmethod
-    def _build_special_map():
-        mapping = {
-            "enter": keyboard.Key.enter,
-            "return": keyboard.Key.enter,
-            "space": keyboard.Key.space,
-            "tab": keyboard.Key.tab,
-            "esc": keyboard.Key.esc,
-            "escape": keyboard.Key.esc,
-            "backspace": keyboard.Key.backspace,
-            "delete": keyboard.Key.delete,
-            "insert": keyboard.Key.insert,
-            "home": keyboard.Key.home,
-            "end": keyboard.Key.end,
-            "page_up": keyboard.Key.page_up,
-            "page_down": keyboard.Key.page_down,
-            "up": keyboard.Key.up,
-            "down": keyboard.Key.down,
-            "left": keyboard.Key.left,
-            "right": keyboard.Key.right,
-        }
-        for i in range(1, 13):
-            mapping[f"f{i}"] = getattr(keyboard.Key, f"f{i}")
-        return mapping
+        self.sender = KeySender()
 
     def _send_key(self, key_text: str) -> None:
         raw = key_text.strip()
         if not raw:
             return
-        normalized = re.sub(r"[\\s-]+", "_", raw.lower())
-        if normalized in self.special_map:
-            key_obj = self.special_map[normalized]
-            self.controller.press(key_obj)
-            self.controller.release(key_obj)
+        normalized = re.sub(r"[\s-]+", "_", raw.lower())
+        normalized = SPECIAL_ALIASES.get(normalized, normalized)
+        if normalized in VK_CODES:
+            self.sender.send_vk(VK_CODES[normalized], normalized in EXTENDED_KEYS)
             return
         if len(raw) == 1:
-            self.controller.press(raw)
-            self.controller.release(raw)
+            self.sender.send_char(raw)
             return
-        # Treat multi-character input as text.
-        self.controller.type(raw)
+        self.sender.send_text(raw)
 
     def run(self):
         while not self.stop_event.is_set():

@@ -18,7 +18,6 @@ hotkeys, and save/load JSON configs.
 ## Setup (uv)
 ```powershell
 uv venv .venv
-uv pip install --python .venv pynput
 ```
 
 ## Run
